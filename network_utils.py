@@ -185,18 +185,50 @@ def create_graph(data, cutoff=0.95, method_name='None', dataset_name=''):
         gene_1 = edges.index[row]
         gene_2 = edges.columns[col]
         G.add_edge(gene_1, gene_2, weight=weight)    
+   
+    edges_with_weights = [(u, v, d['weight']) for u, v, d in G.edges(data=True)]
+    top_5_edges = sorted(edges_with_weights, key=lambda x: x[2], reverse=True)[:5]
+    
     pos = nx.spring_layout(G)
     es, weights = zip(*nx.get_edge_attributes(G, 'weight').items())
     nx.draw_networkx_nodes(G, pos, node_color='lightblue', node_size=50)
     nx.draw_networkx_edges(G, pos, edgelist=es, edge_color=weights, width=1, edge_cmap=plt.cm.Blues)
 
+    for source, target, weight in top_5_edges[::-1]:
+        x1, y1 = pos[source]
+        x2, y2 = pos[target]
+        plt.annotate(
+            f"{source}-->{target}\n({weight:.2f})",
+            xy=((x1 + x2) / 2, (y1 + y2) / 2),
+            xytext=(0, 10),
+            textcoords='offset points',
+            ha='center',
+            va='bottom',
+            bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.5),
+            arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0')
+        )
+
+    if method_name == 'None':
+        plt.title('Top GRN Inference Edges' + '\n on ' + dataset_name + " (annotated)")
+    else:
+        plt.title('Top GRN Inference Edges with Imputation Method ' + method_name + '\n on ' + dataset_name + " (annotated)") 
+    plt.axis('off')
+    plt.show()
+
+    nx.draw_networkx_nodes(G, pos, node_color='lightblue', node_size=50)
+    nx.draw_networkx_edges(G, pos, edgelist=es, edge_color=weights, width=1, edge_cmap=plt.cm.Blues)
     if method_name == 'None':
         plt.title('Top GRN Inference Edges' + '\n on ' + dataset_name)
     else:
         plt.title('Top GRN Inference Edges with Imputation Method ' + method_name + '\n on ' + dataset_name) 
     plt.axis('off')
     plt.show()
+
+    print("Top 5 edges by weight:")
+    for source, target, weight in top_5_edges:
+        print(f"{source}-->{target} (weight: {weight})")
     return G
+
 
 def run_GRN_and_graph(data, save_path, dataset_name='', n_genes=100):
     print("Num genes:", n_genes)
@@ -239,6 +271,103 @@ def run_GRN_and_graph(data, save_path, dataset_name='', n_genes=100):
         G = create_graph(vim, cutoff=0.95, method_name=method, dataset_name=dataset_name)
         edges_dict[method] = set(G.edges())
     return edges_dict
+
+
+def perturb_data(data, noise_level=0.01):
+    return data + np.random.normal(0, noise_level, data.shape)
+
+def jaccard_similarity(set1, set2):
+    intersection = len(set1.intersection(set2))
+    union = len(set1.union(set2))
+    return intersection / union if union != 0 else 0
+
+
+def evaluate_genie3_robustness(x, method_name, dataset_name, n_runs=5, noise_level=0.01):
+    base_edges = None
+    all_edge_sets = []
+
+    for i in range(n_runs):
+        perturbed_data = perturb_data(x, noise_level)
+        perturbed_data[perturbed_data == 0] = 1e-5
+        
+        vim = GENIE3(perturbed_data, nthreads=12, ntrees=100, regulators='all')
+        G = create_graph(vim, cutoff=0.95, method_name=method_name, dataset_name=dataset_name + "_perturbed_" + str(i))
+        edge_set = set(G.edges())
+        
+        all_edge_sets.append(edge_set)
+        
+        if i == 0:
+            base_edges = edge_set
+
+    jaccard_similarities = [jaccard_similarity(base_edges, edge_set) for edge_set in all_edge_sets[1:]]
+    
+    mean_similarity = np.mean(jaccard_similarities)
+    std_similarity = np.std(jaccard_similarities)
+
+    return mean_similarity, std_similarity
+
+
+
+def run_GRN_and_graph_with_peturbations(data, save_path, dataset_name='', n_genes=100):
+    print("Num genes:", n_genes)
+    sampled = pd.DataFrame(np.load(save_path + 'sampled.npy'))
+    edges_dict = {}
+    robustness_dict = {}
+
+    for i, method in enumerate([None, 'SAUCIE', 'scScope', 'DeepImpute', 'MAGIC', 'SCVI', 'KNN']):
+        print(i, method)
+        if method is None:
+            x = np.transpose(sampled.values)
+            method = 'None'
+        elif method == 'SAUCIE':
+            print("Running SAUCIE")
+            run_saucie(save_path + 'sampled.npy', save_path + 'sampled.npy', i, save_path)
+            x = np.load(save_path + 'yhat_SAUCIE.npy')
+        elif method == 'scScope':
+            print("Running scScope")
+            run_scScope(save_path + 'sampled.npy', save_path + 'sampled.npy', i, save_path)
+            x = np.load(save_path + 'yhat_scScope.npy')
+        elif method == 'DeepImpute':
+            print("Running DeepImpute")
+            run_deepImpute(save_path + 'sampled.npy', save_path + 'sampled.npy', i, save_path)
+            x = np.load(save_path + 'yhat_deepImpute.npy')
+        elif method == 'MAGIC':
+            print("Running MAGIC")
+            run_magic(save_path + 'sampled.npy', save_path + 'sampled.npy', i, save_path)
+            x_final = np.load(save_path + 'yhat_MAGIC_t_7.npy')
+            x_0 = np.load(save_path + 'yhat_MAGIC_t_7_0.npy')
+            x_1 = np.load(save_path + 'yhat_MAGIC_t_7_1.npy')
+            x_2 = np.load(save_path + 'yhat_MAGIC_t_7_2.npy')
+            for x_name, x_val in [('_final', x_final), ('_0', x_0), ('_1', x_1), ('_2', x_2)]:
+                x_val[x_val == 0] = 1e-5
+                vim = GENIE3(x_val, nthreads=12, ntrees=100, regulators='all')
+                G = create_graph(vim, cutoff=0.95, method_name=method + x_name, dataset_name=dataset_name)
+                edges_dict[method + x_name] = set(G.edges())
+                mean_similarity, std_similarity = evaluate_genie3_robustness(x_val, method_name=method + x_name, dataset_name=dataset_name)
+                robustness_dict[method + x_name] = (mean_similarity, std_similarity)
+            continue
+        elif method == "SCVI":
+            print("Running SCVI")
+            run_scvi(save_path + 'sampled.npy', save_path + 'sampled.npy', i, save_path)
+            x = np.load(save_path + 'y_hat_scvi.npy')
+        elif method == "KNN":
+            print("Running KNN")
+            run_knn(save_path + 'sampled.npy', save_path + 'sampled.npy', i, save_path, k=32)
+            x = np.load(save_path + 'y_hat_knn.npy')
+
+        x[x == 0] = 1e-5
+        vim = GENIE3(x, nthreads=12, ntrees=100, regulators='all')
+        G = create_graph(vim, cutoff=0.95, method_name=method, dataset_name=dataset_name)
+        edges_dict[method] = set(G.edges())
+
+        # Evaluate robustness
+        mean_similarity, std_similarity = evaluate_genie3_robustness(x, method_name=method, dataset_name=dataset_name)
+        robustness_dict[method] = (mean_similarity, std_similarity)
+
+    return edges_dict, robustness_dict
+
+
+
 
 def run_GRN_and_graph_with_gt(data, save_path, dataset_name='', n_genes=100):
     print("Num genes:", n_genes)
